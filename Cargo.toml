@@ -1,0 +1,9 @@
+[package]
+name = "otter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+rquickjs = { version = "0.12.2", features = ["parallel"] }
+crossbeam-channel = "0.5"
