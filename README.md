@@ -34,12 +34,13 @@ runtime exits when all processes (including spawned ones) have finished.
 | --- | --- |
 | `spawn(code)` | Start a new process from a source string, returns its pid. |
 | `send(pid, value)` | Serialize `value` to JSON and deliver it to `pid`'s mailbox. Messages to dead pids are dropped silently. |
-| `await recv()` | Suspend until a message arrives; resolves with the parsed value. |
+| `await recv(timeoutMs?)` | Suspend until a message arrives; resolves with the parsed value. With a `timeoutMs` it rejects with a `TimeoutError` if no message arrives in time (a message that races the deadline stays in the mailbox). |
+| `await sleep(ms)` | Suspend the process for at least `ms` milliseconds; does not touch the mailbox. |
 | `await yieldNow()` | Voluntarily give up the current slice and rejoin the back of the run queue. (Not named `yield` because that word is reserved inside async-function bodies, which is how top-level-await scripts are parsed.) |
 | `self()` | The current process's pid. |
 | `console.log/error` | Line-oriented output prefixed with the pid. |
 
-Scripts support top-level `await`.
+Scripts support top-level `await`. Full API docs live in [`docs/`](docs/README.md).
 
 ## Examples
 
@@ -47,14 +48,18 @@ Scripts support top-level `await`.
 cargo run --release -- examples/ping_pong.js          # two processes volleying messages
 cargo run --release -- --workers 1 examples/ring.js   # 1000 processes on ONE thread
 cargo run --release -- examples/coop.js               # yieldNow()-driven interleaving
+cargo run --release -- examples/timer.js              # sleep() and recv(timeoutMs) watchdog
 ```
 
 ## Limitations (v1)
 
 - Cooperative scheduling: a long synchronous loop without `await`/`yieldNow()`
   monopolizes its worker thread until it suspends (no preemption yet).
-- One outstanding `recv()` or `yieldNow()` per process.
-- No timers (`recv` timeout / `sleep`) yet.
+- Timers are serviced by idle workers on a ~5 ms tick, so `sleep()`/`recv()`
+  deadlines are accurate to within a tick or two, not to the millisecond.
+- At most one outstanding suspension per process: calling `sleep()` while a
+  `recv()` is pending (or vice versa) raises a `TypeError`. `recv()`/`yieldNow()`
+  after a `sleep()` is fine once the sleep has completed.
 - Messages must be JSON-serializable; functions, symbols and `undefined` are
   rejected.
 

@@ -3,9 +3,10 @@
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rquickjs::context::EvalOptions;
-use rquickjs::prelude::Rest;
+use rquickjs::prelude::{Opt, Rest};
 use rquickjs::{Context, Ctx, Function, Object, Promise, Runtime, Value};
 
 use crate::scheduler::{self, Pid, World};
@@ -18,6 +19,8 @@ pub enum Status {
     Waiting,
     /// The process called `yieldNow()` and is waiting to be re-scheduled.
     Yielding,
+    /// The process called `sleep()` and is waiting for its deadline.
+    Sleeping,
     /// The entry script finished successfully.
     Done,
     /// The entry script (or a job) raised an uncaught error.
@@ -30,6 +33,10 @@ pub struct ProcShared {
     pub name: String,
     pub inbox_rx: Mutex<Receiver<String>>,
     pub status: Mutex<Status>,
+    /// Deadline of the outstanding `sleep()` or `recv(timeoutMs)` suspension,
+    /// if any. At most one waiter per process, so a single field suffices;
+    /// the scheduler reads it when parking the process to register the timer.
+    pub deadline: Mutex<Option<Instant>>,
 }
 
 /// One process: an isolated QuickJS runtime + context plus shared state.
@@ -59,6 +66,7 @@ pub fn create_process(
         name: name.to_string(),
         inbox_rx: Mutex::new(inbox_rx),
         status: Mutex::new(Status::Running),
+        deadline: Mutex::new(None),
     });
 
     let setup: Result<(), String> = ctx.with(|cx| {
@@ -92,6 +100,11 @@ fn setup_globals<'js>(
 ) -> rquickjs::Result<()> {
     let globals = cx.globals();
 
+    // Distinguishable error type for `recv(timeoutMs)` timeouts.
+    cx.eval::<(), _>(
+        "var TimeoutError = class extends Error { constructor(msg) { super(msg); this.name = 'TimeoutError'; } };",
+    )?;
+
     let w = world.clone();
     globals.set(
         "spawn",
@@ -120,24 +133,65 @@ fn setup_globals<'js>(
         "recv",
         Function::new(
             cx.clone(),
-            move |cx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
-                let (promise, resolve, _reject) = Promise::new(&cx)?;
+            move |cx: Ctx<'js>, timeout_ms: Opt<f64>| -> rquickjs::Result<Promise<'js>> {
+                // At most one outstanding suspension per process.
+                let pending_sleep: Option<Function> = cx.globals().get("__otter_sleep_resolve")?;
+                if pending_sleep.is_some() {
+                    return Err(js_type_error(
+                        &cx,
+                        "cannot call recv() while a sleep() is pending",
+                    ));
+                }
+                let (promise, resolve, reject) = Promise::new(&cx)?;
                 match s.inbox_rx.lock().unwrap().try_recv() {
                     Ok(json) => {
                         let v: Value = cx.json_parse(json)?;
                         resolve.call::<_, ()>((v,))?;
                     }
                     Err(TryRecvError::Empty) => {
-                        // Park: stash the resolver in JS space and mark the
+                        // Park: stash the resolvers in JS space and mark the
                         // process as waiting. The scheduler parks it after
-                        // this job completes.
+                        // this job completes and registers the deadline.
                         cx.globals().set("__otter_recv_resolve", resolve)?;
+                        cx.globals().set("__otter_recv_reject", reject)?;
+                        if let Some(ms) = timeout_ms.0 {
+                            let ms = if ms.is_finite() { ms.max(0.0) } else { 0.0 };
+                            *s.deadline.lock().unwrap() =
+                                Some(Instant::now() + Duration::from_millis(ms as u64));
+                        }
                         *s.status.lock().unwrap() = Status::Waiting;
                     }
                     Err(TryRecvError::Disconnected) => {
                         resolve.call::<_, ()>(())?;
                     }
                 }
+                Ok(promise)
+            },
+        )?,
+    )?;
+
+    // Suspend the process until `ms` milliseconds have elapsed. The deadline
+    // is registered when the scheduler parks the (now Sleeping) process.
+    let s = shared.clone();
+    globals.set(
+        "sleep",
+        Function::new(
+            cx.clone(),
+            move |cx: Ctx<'js>, ms: f64| -> rquickjs::Result<Promise<'js>> {
+                // At most one outstanding suspension per process.
+                let pending_recv: Option<Function> = cx.globals().get("__otter_recv_resolve")?;
+                if pending_recv.is_some() {
+                    return Err(js_type_error(
+                        &cx,
+                        "cannot call sleep() while a recv() is pending",
+                    ));
+                }
+                let (promise, resolve, _reject) = Promise::new(&cx)?;
+                let ms = if ms.is_finite() { ms.max(0.0) } else { 0.0 };
+                cx.globals().set("__otter_sleep_resolve", resolve)?;
+                *s.deadline.lock().unwrap() =
+                    Some(Instant::now() + Duration::from_millis(ms as u64));
+                *s.status.lock().unwrap() = Status::Sleeping;
                 Ok(promise)
             },
         )?,
