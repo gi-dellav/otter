@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use rquickjs::context::EvalOptions;
 use rquickjs::prelude::{Opt, Rest};
-use rquickjs::{Context, Ctx, Function, Object, Promise, Runtime, Value};
+use rquickjs::{Array, Context, Ctx, Function, Object, Promise, Runtime, Value};
 
 use crate::scheduler::{self, Pid, World};
 
@@ -25,18 +25,49 @@ pub enum Status {
     Done,
     /// The entry script (or a job) raised an uncaught error.
     Failed,
+    /// A `killProcess()` request was accepted; the process will be reaped at
+    /// its next scheduling boundary. Terminal, like `Done`/`Failed`.
+    Killed,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Running => "running",
+            Status::Waiting => "waiting",
+            Status::Yielding => "yielding",
+            Status::Sleeping => "sleeping",
+            Status::Done => "done",
+            Status::Failed => "failed",
+            Status::Killed => "killed",
+        }
+    }
 }
 
 /// State shared between the scheduler and the JS callbacks of one process.
 pub struct ProcShared {
     pub pid: Pid,
-    pub name: String,
+    pub name: Mutex<String>,
     pub inbox_rx: Mutex<Receiver<String>>,
     pub status: Mutex<Status>,
     /// Deadline of the outstanding `sleep()` or `recv(timeoutMs)` suspension,
     /// if any. At most one waiter per process, so a single field suffices;
     /// the scheduler reads it when parking the process to register the timer.
     pub deadline: Mutex<Option<Instant>>,
+}
+
+impl ProcShared {
+    /// Set the status unless the process is being killed. A killed process
+    /// keeps `Status::Killed` so the scheduler reaps it at its next slice;
+    /// a suspension callback (`recv`/`sleep`/`yieldNow`) or a wake must
+    /// never overwrite that. The check and write are one critical section,
+    /// so they cannot race a concurrent `killProcess`.
+    pub fn set_status_unless_killed(&self, status: Status) {
+        let mut st = self.status.lock().unwrap();
+        if *st != Status::Killed {
+            *st = status;
+        }
+    }
 }
 
 /// One process: an isolated QuickJS runtime + context plus shared state.
@@ -63,11 +94,15 @@ pub fn create_process(
     let ctx = Context::full(&rt).map_err(|e| e.to_string())?;
     let shared = Arc::new(ProcShared {
         pid,
-        name: name.to_string(),
+        name: Mutex::new(name.to_string()),
         inbox_rx: Mutex::new(inbox_rx),
         status: Mutex::new(Status::Running),
         deadline: Mutex::new(None),
     });
+    // Register before evaluating the entry script: synchronous code in the
+    // script (e.g. a self-kill or `listProcesses()` call) must already see
+    // this pid, mirroring the inbox-registration invariant in `spawn_process`.
+    world.processes.lock().unwrap().insert(pid, shared.clone());
 
     let setup: Result<(), String> = ctx.with(|cx| {
         setup_globals(&cx, world, &shared).map_err(|e| e.to_string())?;
@@ -159,7 +194,7 @@ fn setup_globals<'js>(
                             *s.deadline.lock().unwrap() =
                                 Some(Instant::now() + Duration::from_millis(ms as u64));
                         }
-                        *s.status.lock().unwrap() = Status::Waiting;
+                        s.set_status_unless_killed(Status::Waiting);
                     }
                     Err(TryRecvError::Disconnected) => {
                         resolve.call::<_, ()>(())?;
@@ -191,7 +226,7 @@ fn setup_globals<'js>(
                 cx.globals().set("__otter_sleep_resolve", resolve)?;
                 *s.deadline.lock().unwrap() =
                     Some(Instant::now() + Duration::from_millis(ms as u64));
-                *s.status.lock().unwrap() = Status::Sleeping;
+                s.set_status_unless_killed(Status::Sleeping);
                 Ok(promise)
             },
         )?,
@@ -207,7 +242,7 @@ fn setup_globals<'js>(
             move |cx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
                 let (promise, resolve, _reject) = Promise::new(&cx)?;
                 cx.globals().set("__otter_yield_resolve", resolve)?;
-                *s.status.lock().unwrap() = Status::Yielding;
+                s.set_status_unless_killed(Status::Yielding);
                 Ok(promise)
             },
         )?,
@@ -216,11 +251,84 @@ fn setup_globals<'js>(
     let s = shared.clone();
     globals.set("self", Function::new(cx.clone(), move || -> u64 { s.pid })?)?;
 
+    let w = world.clone();
+    globals.set(
+        "killProcess",
+        Function::new(cx.clone(), move |pid: u64| -> bool {
+            scheduler::kill_process(&w, pid)
+        })?,
+    )?;
+
+    let w = world.clone();
+    globals.set(
+        "listProcesses",
+        Function::new(
+            cx.clone(),
+            move |cx: Ctx<'js>| -> rquickjs::Result<Array<'js>> {
+                let procs = scheduler::list_processes(&w);
+                let arr = Array::new(cx.clone())?;
+                for (i, (pid, name, status)) in procs.into_iter().enumerate() {
+                    let obj = Object::new(cx.clone())?;
+                    obj.set("pid", pid)?;
+                    obj.set("name", name)?;
+                    obj.set("status", status)?;
+                    arr.set(i, obj)?;
+                }
+                Ok(arr)
+            },
+        )?,
+    )?;
+
+    let w = world.clone();
+    globals.set(
+        "isProcessAlive",
+        Function::new(cx.clone(), move |pid: u64| -> bool {
+            scheduler::is_process_alive(&w, pid)
+        })?,
+    )?;
+
+    let w = world.clone();
+    globals.set(
+        "processInfo",
+        Function::new(
+            cx.clone(),
+            move |cx: Ctx<'js>, pid: u64| -> rquickjs::Result<Value<'js>> {
+                match scheduler::process_info(&w, pid) {
+                    Some((pid, name, status)) => {
+                        let obj = Object::new(cx.clone())?;
+                        obj.set("pid", pid)?;
+                        obj.set("name", name)?;
+                        obj.set("status", status)?;
+                        Ok(obj.into_value())
+                    }
+                    None => Ok(Value::new_null(cx.clone())),
+                }
+            },
+        )?,
+    )?;
+
+    let w = world.clone();
+    globals.set(
+        "processCount",
+        Function::new(cx.clone(), move || -> usize {
+            scheduler::process_count(&w)
+        })?,
+    )?;
+
+    let w = world.clone();
+    let s = shared.clone();
+    globals.set(
+        "setName",
+        Function::new(cx.clone(), move |name: String| {
+            scheduler::set_process_name(&w, s.pid, name);
+        })?,
+    )?;
+
     let s = shared.clone();
     globals.set(
         "__otter_done",
         Function::new(cx.clone(), move || {
-            *s.status.lock().unwrap() = Status::Done;
+            s.set_status_unless_killed(Status::Done);
         })?,
     )?;
 
@@ -228,8 +336,13 @@ fn setup_globals<'js>(
     globals.set(
         "__otter_error",
         Function::new(cx.clone(), move |msg: String| {
-            eprintln!("[pid {}] error: {msg}", s.pid);
-            *s.status.lock().unwrap() = Status::Failed;
+            // A killed process dies silently: no error report and no `Failed`
+            // status, so a kill can never turn into a non-zero exit code.
+            let mut st = s.status.lock().unwrap();
+            if *st != Status::Killed {
+                eprintln!("[pid {}] error: {msg}", s.pid);
+                *st = Status::Failed;
+            }
         })?,
     )?;
 

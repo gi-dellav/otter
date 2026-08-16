@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rquickjs::{Context, Ctx, Function, Value};
 
-use crate::process::{self, Process, Status};
+use crate::process::{self, ProcShared, Process, Status};
 
 pub type Pid = u64;
 
@@ -74,6 +74,11 @@ pub struct World {
     timers: Mutex<BinaryHeap<TimerEntry>>,
     /// Inbox senders for every live process, keyed by pid.
     pub inboxes: Mutex<HashMap<Pid, mpsc::Sender<String>>>,
+    /// Metadata for every live process, keyed by pid. The source of truth
+    /// for liveness and for the management API (`listProcesses`,
+    /// `killProcess`, `processInfo`, ...). Inserted before a process's code
+    /// can run, removed in `finish`.
+    pub processes: Mutex<HashMap<Pid, Arc<ProcShared>>>,
     pub next_pid: AtomicU64,
     /// Number of live processes; main waits on `active_cv` for this to hit 0.
     pub active: Mutex<usize>,
@@ -91,6 +96,7 @@ impl World {
             sleeping: Mutex::new(HashMap::new()),
             timers: Mutex::new(BinaryHeap::new()),
             inboxes: Mutex::new(HashMap::new()),
+            processes: Mutex::new(HashMap::new()),
             next_pid: AtomicU64::new(0),
             active: Mutex::new(0),
             active_cv: Condvar::new(),
@@ -111,6 +117,7 @@ pub fn spawn_process(world: &Arc<World>, name: &str, source: &str) -> Result<Pid
         Ok(proc) => proc,
         Err(e) => {
             world.inboxes.lock().unwrap().remove(&pid);
+            world.processes.lock().unwrap().remove(&pid);
             return Err(e);
         }
     };
@@ -150,7 +157,7 @@ pub fn send_message<'js>(
             return Err(process::js_type_error(
                 cx,
                 "value is not message-serializable",
-            ))
+            ));
         }
     };
 
@@ -166,6 +173,76 @@ pub fn send_message<'js>(
         }
     }
     Ok(())
+}
+
+/// Request termination of a live process. Best-effort and cooperative: the
+/// target is marked `Status::Killed` and reaped at its next scheduling
+/// boundary. Parked (`recv`) and sleeping processes are force-requeued so
+/// that happens promptly; a process on the run queue or mid-slice is reaped
+/// by the worker that next picks it up. Returns `false` for unknown pids
+/// (already dead, or never existed).
+pub fn kill_process(world: &Arc<World>, pid: Pid) -> bool {
+    let Some(shared) = world.processes.lock().unwrap().get(&pid).cloned() else {
+        return false;
+    };
+    {
+        let mut st = shared.status.lock().unwrap();
+        if *st != Status::Done && *st != Status::Failed {
+            *st = Status::Killed;
+        }
+    }
+    // Pull the process out of a map if it is parked/sleeping, so it gets a
+    // scheduling boundary and is reaped. Processes on the queue or in a
+    // worker's hands need no relocation: their next slice sees `Killed`.
+    if let Some(p) = world.parked.lock().unwrap().remove(&pid) {
+        let _ = world.queue_tx.send(RunItem::Process(p));
+    } else if let Some(p) = world.sleeping.lock().unwrap().remove(&pid) {
+        let _ = world.queue_tx.send(RunItem::Process(p));
+    }
+    true
+}
+
+/// Snapshot of every live process as `(pid, name, status)`, sorted by pid.
+pub fn list_processes(world: &Arc<World>) -> Vec<(Pid, String, String)> {
+    let reg = world.processes.lock().unwrap();
+    let mut out: Vec<(Pid, String, String)> = reg
+        .iter()
+        .map(|(pid, s)| {
+            (
+                *pid,
+                s.name.lock().unwrap().clone(),
+                s.status.lock().unwrap().as_str().to_string(),
+            )
+        })
+        .collect();
+    out.sort_by_key(|(pid, _, _)| *pid);
+    out
+}
+
+pub fn is_process_alive(world: &Arc<World>, pid: Pid) -> bool {
+    world.processes.lock().unwrap().contains_key(&pid)
+}
+
+/// Info for one process as `(pid, name, status)`, or `None` if unknown.
+pub fn process_info(world: &Arc<World>, pid: Pid) -> Option<(Pid, String, String)> {
+    let reg = world.processes.lock().unwrap();
+    let s = reg.get(&pid)?;
+    Some((
+        pid,
+        s.name.lock().unwrap().clone(),
+        s.status.lock().unwrap().as_str().to_string(),
+    ))
+}
+
+pub fn process_count(world: &Arc<World>) -> usize {
+    world.processes.lock().unwrap().len()
+}
+
+/// Rename a live process; a no-op for unknown pids.
+pub fn set_process_name(world: &Arc<World>, pid: Pid, name: String) {
+    if let Some(s) = world.processes.lock().unwrap().get(&pid) {
+        *s.name.lock().unwrap() = name;
+    }
 }
 
 /// Worker entry point: pull processes off the run queue until stopped. Idle
@@ -186,6 +263,12 @@ pub fn worker_loop(world: Arc<World>) {
 /// process is done, parks, or goes back on the run queue.
 fn run_slice(world: &Arc<World>, p: Box<Process>) {
     let wake_status = *p.shared.status.lock().unwrap();
+    if wake_status == Status::Killed {
+        // A kill landed between slices (or while queued): reap without
+        // running anything.
+        finish(world, p);
+        return;
+    }
     match wake_status {
         Status::Waiting => {
             let msg = p.shared.inbox_rx.lock().unwrap().try_recv();
@@ -225,17 +308,18 @@ fn run_slice(world: &Arc<World>, p: Box<Process>) {
     let status = *p.shared.status.lock().unwrap();
     if status != Status::Done
         && status != Status::Failed
+        && status != Status::Killed
         && p.rt.is_job_pending()
         && let Err(exc) = p.rt.execute_pending_job()
     {
         let msg = exception_message(&exc.0);
         eprintln!("[pid {}] unhandled exception: {msg}", p.shared.pid);
-        *p.shared.status.lock().unwrap() = Status::Failed;
+        p.shared.set_status_unless_killed(Status::Failed);
     }
 
     let status = *p.shared.status.lock().unwrap();
     match status {
-        Status::Done | Status::Failed => finish(world, p),
+        Status::Done | Status::Failed | Status::Killed => finish(world, p),
         Status::Waiting => park(world, p),
         Status::Sleeping => park_sleep(world, p),
         // A process that yielded goes to the back of the run queue; its
@@ -266,7 +350,7 @@ fn wake_with(p: &Process, json: String) -> rquickjs::Result<()> {
             globals.set("__otter_recv_resolve", ())?;
             globals.set("__otter_recv_reject", ())?;
         }
-        *p.shared.status.lock().unwrap() = Status::Running;
+        p.shared.set_status_unless_killed(Status::Running);
         *p.shared.deadline.lock().unwrap() = None;
         Ok(())
     })
@@ -282,7 +366,7 @@ fn wake_yield(p: &Process) -> rquickjs::Result<()> {
             resolve.call::<_, ()>(())?;
             globals.set("__otter_yield_resolve", ())?;
         }
-        *p.shared.status.lock().unwrap() = Status::Running;
+        p.shared.set_status_unless_killed(Status::Running);
         Ok(())
     })
 }
@@ -303,6 +387,15 @@ fn park(world: &Arc<World>, p: Box<Process>) {
             }
         }
         Err(TryRecvError::Empty) => {
+            // A kill can land while this process is still finishing its
+            // slice (after its status was last read). Re-check under the
+            // parked lock so a killed process is reaped instead of parked
+            // forever waiting for a message that will never wake it.
+            if *p.shared.status.lock().unwrap() == Status::Killed {
+                drop(parked);
+                finish(world, p);
+                return;
+            }
             let pid = p.shared.pid;
             let deadline = *p.shared.deadline.lock().unwrap();
             parked.insert(pid, p);
@@ -330,9 +423,18 @@ fn park(world: &Arc<World>, p: Box<Process>) {
 fn park_sleep(world: &Arc<World>, p: Box<Process>) {
     let pid = p.shared.pid;
     let deadline = *p.shared.deadline.lock().unwrap();
-    world.sleeping.lock().unwrap().insert(pid, p);
-    // The sleeping lock is dropped here (temporary at end of statement), so
-    // we never hold it while touching the timers lock.
+    {
+        let mut sleeping = world.sleeping.lock().unwrap();
+        // Same re-check as `park`: a kill that raced this slice must not
+        // find the process parked in the sleeping map forever.
+        if *p.shared.status.lock().unwrap() == Status::Killed {
+            drop(sleeping);
+            finish(world, p);
+            return;
+        }
+        sleeping.insert(pid, p);
+    }
+    // The sleeping lock is dropped before touching the timers lock.
     if let Some(deadline) = deadline {
         world.timers.lock().unwrap().push(TimerEntry {
             deadline,
@@ -352,7 +454,7 @@ fn wake_sleep(p: &Process) -> rquickjs::Result<()> {
             resolve.call::<_, ()>(())?;
             globals.set("__otter_sleep_resolve", ())?;
         }
-        *p.shared.status.lock().unwrap() = Status::Running;
+        p.shared.set_status_unless_killed(Status::Running);
         // Clear the consumed deadline so a later plain `recv()` doesn't pick
         // it up as a stale timeout.
         *p.shared.deadline.lock().unwrap() = None;
@@ -372,7 +474,7 @@ fn wake_timeout(p: &Process) -> rquickjs::Result<()> {
             globals.set("__otter_recv_resolve", ())?;
             globals.set("__otter_recv_reject", ())?;
         }
-        *p.shared.status.lock().unwrap() = Status::Running;
+        p.shared.set_status_unless_killed(Status::Running);
         *p.shared.deadline.lock().unwrap() = None;
         Ok(())
     })
@@ -431,6 +533,7 @@ fn fail(world: &Arc<World>, p: Box<Process>, msg: &str) {
 /// Unregister a finished process and release its runtime.
 fn finish(world: &Arc<World>, p: Box<Process>) {
     world.inboxes.lock().unwrap().remove(&p.shared.pid);
+    world.processes.lock().unwrap().remove(&p.shared.pid);
     if *p.shared.status.lock().unwrap() == Status::Failed {
         world.failed.fetch_add(1, Ordering::Relaxed);
     }

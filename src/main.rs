@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use clap::Parser;
 
-use otter::scheduler::{worker_loop, RunItem, World};
+use otter::scheduler::{RunItem, World, worker_loop};
 
 fn default_workers() -> usize {
     std::thread::available_parallelism()

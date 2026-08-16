@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use otter::scheduler::{spawn_process, worker_loop, RunItem, World};
+use otter::scheduler::{RunItem, World, spawn_process, worker_loop};
 
 fn wait_for_completion(world: &Arc<World>, timeout: Duration) {
     let active = world.active.lock().unwrap();
@@ -13,7 +13,10 @@ fn wait_for_completion(world: &Arc<World>, timeout: Duration) {
         .wait_timeout_while(active, timeout, |a| *a > 0)
         .unwrap();
     drop(guard);
-    assert!(!timed_out.timed_out(), "processes did not finish within {timeout:?}");
+    assert!(
+        !timed_out.timed_out(),
+        "processes did not finish within {timeout:?}"
+    );
     assert_eq!(world.failed.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
@@ -353,6 +356,128 @@ fn sleep_then_plain_recv_has_no_stale_timeout() {
             spawn(`send(0, "ping");`);
             const m = await recv();
             if (m !== "ping") throw new Error("unexpected: " + m);
+        "#,
+    )
+    .unwrap();
+
+    wait_for_completion(&world, Duration::from_secs(10));
+    let _ = world.queue_tx.send(RunItem::Stop);
+    worker.join().unwrap();
+}
+
+#[test]
+fn kill_process_reaps_parked_and_sleeping_processes() {
+    let world = World::new();
+    let worker = {
+        let w = world.clone();
+        std::thread::spawn(move || worker_loop(w))
+    };
+
+    spawn_process(
+        &world,
+        "killer.js",
+        r#"
+            const parked = spawn(`await recv();`);
+            const sleeper = spawn(`await sleep(60000);`);
+            await sleep(100); // let both park
+            if (processCount() !== 3) throw new Error("expected 3 processes, got " + processCount());
+            const listed = listProcesses().map(p => p.pid);
+            if (!listed.includes(parked) || !listed.includes(sleeper)) {
+                throw new Error("children not listed: " + JSON.stringify(listed));
+            }
+            if (!killProcess(parked)) throw new Error("kill parked failed");
+            if (!killProcess(sleeper)) throw new Error("kill sleeper failed");
+            await sleep(50); // let the reaps happen
+            if (isProcessAlive(parked) || isProcessAlive(sleeper)) {
+                throw new Error("killed process still alive");
+            }
+            if (listProcesses().some(p => p.pid === parked || p.pid === sleeper)) {
+                throw new Error("killed process still listed");
+            }
+            if (processCount() !== 1) throw new Error("expected only self, got " + processCount());
+            send(parked, "hello"); // to a dead pid: dropped silently
+        "#,
+    )
+    .unwrap();
+
+    wait_for_completion(&world, Duration::from_secs(10));
+    let _ = world.queue_tx.send(RunItem::Stop);
+    worker.join().unwrap();
+}
+
+#[test]
+fn kill_self_terminates_current_process() {
+    let world = World::new();
+    let worker = {
+        let w = world.clone();
+        std::thread::spawn(move || worker_loop(w))
+    };
+
+    spawn_process(
+        &world,
+        "selfkill.js",
+        r#"
+            const me = self();
+            if (!killProcess(me)) throw new Error("self kill failed");
+            if (!isProcessAlive(me)) throw new Error("self should still be listed until reaped");
+            // Reaped at the next scheduling boundary: this suspension never
+            // resolves and the process dies instead of parking.
+            await recv();
+            console.log("should never print");
+        "#,
+    )
+    .unwrap();
+
+    wait_for_completion(&world, Duration::from_secs(10));
+    let _ = world.queue_tx.send(RunItem::Stop);
+    worker.join().unwrap();
+}
+
+#[test]
+fn kill_unknown_pid_is_false_and_info_is_null() {
+    let world = World::new();
+    let worker = {
+        let w = world.clone();
+        std::thread::spawn(move || worker_loop(w))
+    };
+
+    spawn_process(
+        &world,
+        "info.js",
+        r#"
+            if (processInfo(99999) !== null) throw new Error("expected null info");
+            if (isProcessAlive(99999)) throw new Error("unknown pid reported alive");
+            if (killProcess(99999)) throw new Error("kill of unknown pid should be false");
+            const info = processInfo(self());
+            if (info.pid !== self()) throw new Error("wrong pid in info");
+            if (typeof info.name !== "string" || typeof info.status !== "string") {
+                throw new Error("bad info shape");
+            }
+        "#,
+    )
+    .unwrap();
+
+    wait_for_completion(&world, Duration::from_secs(10));
+    let _ = world.queue_tx.send(RunItem::Stop);
+    worker.join().unwrap();
+}
+
+#[test]
+fn set_name_updates_process_info_and_list() {
+    let world = World::new();
+    let worker = {
+        let w = world.clone();
+        std::thread::spawn(move || worker_loop(w))
+    };
+
+    spawn_process(
+        &world,
+        "rename.js",
+        r#"
+            setName("renamed-self");
+            if (processInfo(self()).name !== "renamed-self") throw new Error("info name not updated");
+            const listed = listProcesses().find(p => p.pid === self());
+            if (!listed || listed.name !== "renamed-self") throw new Error("list name not updated");
         "#,
     )
     .unwrap();

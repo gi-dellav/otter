@@ -38,6 +38,12 @@ runtime exits when all processes (including spawned ones) have finished.
 | `await sleep(ms)` | Suspend the process for at least `ms` milliseconds; does not touch the mailbox. |
 | `await yieldNow()` | Voluntarily give up the current slice and rejoin the back of the run queue. (Not named `yield` because that word is reserved inside async-function bodies, which is how top-level-await scripts are parsed.) |
 | `self()` | The current process's pid. |
+| `killProcess(pid)` | Request termination of a live process; returns `true` if `pid` is live. Best-effort: the process is reaped at its next scheduling boundary (parked/sleeping processes immediately). Killing an unknown pid returns `false`. |
+| `listProcesses()` | Array of `{pid, name, status}` for every live process, sorted by pid. |
+| `isProcessAlive(pid)` | `true` while `pid` is live. |
+| `processInfo(pid)` | `{pid, name, status}` for a live pid, or `null`. |
+| `processCount()` | Number of live processes. |
+| `setName(name)` | Rename the current process; visible in `listProcesses()`/`processInfo()`. |
 | `console.log/error` | Line-oriented output prefixed with the pid. |
 
 Scripts support top-level `await`. Full API docs live in [`docs/`](docs/README.md).
@@ -49,12 +55,16 @@ cargo run --release -- examples/ping_pong.js          # two processes volleying 
 cargo run --release -- --workers 1 examples/ring.js   # 1000 processes on ONE thread
 cargo run --release -- examples/coop.js               # yieldNow()-driven interleaving
 cargo run --release -- examples/timer.js              # sleep() and recv(timeoutMs) watchdog
+cargo run --release -- examples/process_mgmt.js       # list, inspect, rename, and kill processes
 ```
 
 ## Limitations (v1)
 
 - Cooperative scheduling: a long synchronous loop without `await`/`yieldNow()`
   monopolizes its worker thread until it suspends (no preemption yet).
+- Killing is cooperative too: `killProcess()` takes effect at the target's next
+  scheduling boundary, so a process stuck in a long synchronous loop won't die
+  until it yields.
 - Timers are serviced by idle workers on a ~5 ms tick, so `sleep()`/`recv()`
   deadlines are accurate to within a tick or two, not to the millisecond.
 - At most one outstanding suspension per process: calling `sleep()` while a

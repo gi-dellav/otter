@@ -27,3 +27,4 @@ processes.
 | Parking | A process with an empty mailbox is parked in a `HashMap` keyed by pid. A `send` to a parked pid re-queues it. |
 | Sleeping | A process that called `sleep(ms)` is parked in a separate `sleeping` map, unreachable by `send`. A timer entry re-queues it when the deadline passes. |
 | Timers | Serviced by idle workers every ~5 ms (best-effort, not real-time). |
+| Management | `listProcesses()`, `killProcess(pid)`, `isProcessAlive(pid)`, `processInfo(pid)`, `processCount()`, `setName(name)`. Kills are cooperative: the target is reaped at its next scheduling boundary. |

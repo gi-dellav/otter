@@ -111,6 +111,80 @@ Returns the current process's pid.
 send(0, { from: self() });
 ```
 
+---
+
+## `killProcess(pid) → boolean`
+
+Requests termination of a live process and returns `true` if `pid` was
+live; returns `false` for an unknown or already-finished pid. Killing is
+**best-effort and cooperative**: the target is marked killed and reaped at
+its next scheduling boundary. A process parked on `recv()` or sleeping is
+reaped immediately; a process on the run queue or mid-slice dies when its
+slice ends.
+
+```js
+if (killProcess(other)) {
+  console.log("termination of", other, "requested");
+}
+```
+
+- Killing `self()` is allowed: the current slice finishes, then the process
+  is reaped — any later `await` in that slice never resolves.
+- A killed process dies **silently**: it is not counted as a failure, so
+  the runtime's exit code stays `0`.
+- After the kill, the pid is unregistered: `send` to it is dropped, and
+  `isProcessAlive`/`listProcesses` no longer see it. Pids are never reused.
+- A process stuck in a long synchronous loop (no `await`/`yieldNow()`) will
+  not die until it yields — same cooperative limit as scheduling.
+
+## `listProcesses() → array`
+
+Returns an array of `{pid, name, status}` for every live process, sorted by
+pid. `status` is one of `"running" | "waiting" | "yielding" | "sleeping" |
+"done" | "failed" | "killed"`; the snapshot is taken atomically but the
+world may move on while you inspect it.
+
+```js
+for (const p of listProcesses()) {
+  console.log(`pid ${p.pid} (${p.name}) is ${p.status}`);
+}
+```
+
+## `isProcessAlive(pid) → boolean`
+
+`true` while `pid` is registered as a live process.
+
+```js
+if (isProcessAlive(other)) send(other, "ping");
+```
+
+## `processInfo(pid) → object | null`
+
+Returns `{pid, name, status}` for a live pid, or `null` for an unknown or
+finished pid.
+
+```js
+const info = processInfo(self());
+console.log(info.name);   // the process's name
+```
+
+## `processCount() → number`
+
+Number of live processes, including the caller.
+
+```js
+console.log("live processes:", processCount());
+```
+
+## `setName(name)`
+
+Renames the current process. The new name is visible to every process via
+`listProcesses()` and `processInfo()`; it does not affect the pid.
+
+```js
+setName("http-server");
+```
+
 ## `console.log(...args)` / `console.error(...args)`
 
 Prints a line to stdout/stderr, prefixed with the calling process's pid.
@@ -146,5 +220,7 @@ public API and may change at any time.
   raises a `TypeError`.
 - Once a suspension has completed (resolved or rejected), the next
   suspension is fine — `await sleep(100); await recv();` is valid.
-- A process is never killed from outside: no `kill`, no linked death. An
+- A process can be killed from outside (or by itself) via `killProcess()`;
+  see the [management API](#killprocesspid--boolean) above. Kills are
+  cooperative and take effect at the target's next scheduling boundary. An
   uncaught error terminates only its own process.
