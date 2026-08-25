@@ -2,6 +2,10 @@
 name = "otter"
 version = "0.1.0"
 edition = "2024"
+authors = ["Giuseppe Della Vedova"]
+license = "MIT"
+description = "Experimental multithreaded JS runtime"
+repository = "https://github.com/gi-dellav/otter"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
