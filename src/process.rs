@@ -11,6 +11,42 @@ use rquickjs::{Array, Context, Ctx, Function, Object, Promise, Runtime, Value};
 
 use crate::scheduler::{self, Pid, World};
 
+/// Per-process sandbox policy: a set of on/off toggles. Toggles only ever
+/// narrow — a process can drop a permission it holds, but can never gain one
+/// it lacks (every change is an intersection). Stored on `ProcShared` and read
+/// by the JS callbacks that gate privileged operations; the scheduler itself
+/// never consults it.
+#[derive(Clone, Copy, Debug)]
+pub struct Sandbox {
+    /// If `false`, this process may not `spawn` processes or `killProcess`
+    /// *other* processes. Killing *self* is always allowed.
+    pub can_spawn_and_kill: bool,
+}
+
+impl Sandbox {
+    /// Every toggle on. The sandbox for root (CLI) processes and the default
+    /// a process starts from before any restriction.
+    pub const PRIVILEGED: Sandbox = Sandbox {
+        can_spawn_and_kill: true,
+    };
+
+    /// Every toggle off. A fully confined process.
+    pub const CONFINED: Sandbox = Sandbox {
+        can_spawn_and_kill: false,
+    };
+
+    /// Monotonic narrowing: the result holds a toggle only if both operands
+    /// do. Used to inherit a parent's sandbox at `spawn` time and to apply a
+    /// `restrictSandbox` policy at runtime. This is what makes confinement
+    /// irrevocable in effect: intersecting with `CONFINED` can never be undone
+    /// by a later intersect.
+    pub fn intersect(self, other: Sandbox) -> Sandbox {
+        Sandbox {
+            can_spawn_and_kill: self.can_spawn_and_kill && other.can_spawn_and_kill,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     /// The process is running or runnable (jobs may be pending).
@@ -54,6 +90,11 @@ pub struct ProcShared {
     /// if any. At most one waiter per process, so a single field suffices;
     /// the scheduler reads it when parking the process to register the timer.
     pub deadline: Mutex<Option<Instant>>,
+    /// The process's sandbox policy. Fixed at birth (inherited from the
+    /// parent, narrowed by any `spawn` override) and only ever narrowed
+    /// afterwards via `restrictSandbox`. A mutex even with a single bool so
+    /// future toggles can be mutated in place without an API churn.
+    pub sandbox: Mutex<Sandbox>,
 }
 
 impl ProcShared {
@@ -89,6 +130,7 @@ pub fn create_process(
     name: &str,
     source: &str,
     inbox_rx: Receiver<String>,
+    sandbox: Sandbox,
 ) -> Result<Process, String> {
     let rt = Runtime::new().map_err(|e| e.to_string())?;
     let ctx = Context::full(&rt).map_err(|e| e.to_string())?;
@@ -98,6 +140,7 @@ pub fn create_process(
         inbox_rx: Mutex::new(inbox_rx),
         status: Mutex::new(Status::Running),
         deadline: Mutex::new(None),
+        sandbox: Mutex::new(sandbox),
     });
     // Register before evaluating the entry script: synchronous code in the
     // script (e.g. a self-kill or `listProcesses()` call) must already see
@@ -140,13 +183,45 @@ fn setup_globals<'js>(
         "var TimeoutError = class extends Error { constructor(msg) { super(msg); this.name = 'TimeoutError'; } };",
     )?;
 
+    // Distinguishable error type for sandbox permission violations (a
+    // privileged operation attempted by a process whose sandbox denies it).
+    cx.eval::<(), _>(
+        "var PermissionError = class extends Error { constructor(msg) { super(msg); this.name = 'PermissionError'; } };",
+    )?;
+
     let w = world.clone();
+    let s = shared.clone();
     globals.set(
         "spawn",
         Function::new(
             cx.clone(),
-            move |cx: Ctx<'js>, code: String| -> rquickjs::Result<u64> {
-                scheduler::spawn_process(&w, "<spawned>", &code)
+            move |cx: Ctx<'js>, code: String, opts: Opt<Value<'js>>| -> rquickjs::Result<u64> {
+                let parent = *s.sandbox.lock().unwrap();
+                if !parent.can_spawn_and_kill {
+                    return Err(permission_error(
+                        &cx,
+                        "spawn is not permitted in this sandbox",
+                    ));
+                }
+                // Child sandbox: inherit the parent, narrowed by any explicit
+                // override. Absent keys inherit; `true` is a no-op intersect;
+                // only `false` narrows. No escalation is possible: the child can
+                // never hold a toggle the parent lacks.
+                let mut child = parent;
+                if let Some(opts_v) = opts.0
+                    && let Some(opts_obj) = opts_v.as_object()
+                {
+                    let sb_v: Option<Value> = opts_obj.get("sandbox")?;
+                    if let Some(sb_v) = sb_v
+                        && let Some(sb_obj) = sb_v.as_object()
+                    {
+                        let csk: Option<bool> = sb_obj.get("canSpawnAndKill")?;
+                        if let Some(false) = csk {
+                            child.can_spawn_and_kill = false;
+                        }
+                    }
+                }
+                scheduler::spawn_process(&w, "<spawned>", &code, child)
                     .map_err(|msg| js_type_error(&cx, &msg))
             },
         )?,
@@ -251,12 +326,119 @@ fn setup_globals<'js>(
     let s = shared.clone();
     globals.set("self", Function::new(cx.clone(), move || -> u64 { s.pid })?)?;
 
+    let s = shared.clone();
     let w = world.clone();
     globals.set(
         "killProcess",
-        Function::new(cx.clone(), move |pid: u64| -> bool {
-            scheduler::kill_process(&w, pid)
+        Function::new(
+            cx.clone(),
+            move |cx: Ctx<'js>, pid: u64| -> rquickjs::Result<bool> {
+                // Killing *self* is always allowed; killing another process
+                // requires the sandbox toggle. The privilege check runs before
+                // the liveness check so a confined process learns nothing about
+                // whether an unknown pid exists — it gets `PermissionError`
+                // regardless.
+                if !s.sandbox.lock().unwrap().can_spawn_and_kill && pid != s.pid {
+                    return Err(permission_error(
+                        &cx,
+                        "killProcess on another process is not permitted in this sandbox",
+                    ));
+                }
+                Ok(scheduler::kill_process(&w, pid))
+            },
+        )?,
+    )?;
+
+    // Snapshot the current process's own sandbox as `{canSpawnAndKill: bool}`.
+    // The only way to read a sandbox across the JS API; capability info is not
+    // exposed via `processInfo`/`listProcesses`.
+    let s = shared.clone();
+    globals.set(
+        "selfSandbox",
+        Function::new(cx.clone(), move |cx: Ctx<'js>| -> rquickjs::Result<Value<'js>> {
+            let sb = *s.sandbox.lock().unwrap();
+            sandbox_snapshot(&cx, &sb)
         })?,
+    )?;
+
+    // Narrow a sandbox at runtime. Monotonic: only intersections, so a
+    // dropped toggle can never come back. Returns the target's post-state.
+    //
+    // - `restrictSandbox()` / `restrictSandbox({})` on self: pure read.
+    // - `restrictSandbox({canSpawnAndKill:false})` on self: always allowed
+    //   (a loss of privilege needs no privilege); irrevocable in effect.
+    // - `restrictSandbox({canSpawnAndKill:false}, {pid: other})`: the caller
+    //   must currently hold the toggle being dropped, and the request must
+    //   actually narrow (no pure reads or widen attempts on others). An
+    //   unknown target raises `TypeError` *after* the privilege check, so a
+    //   confined caller still gets `PermissionError` first.
+    let s = shared.clone();
+    let w = world.clone();
+    globals.set(
+        "restrictSandbox",
+        Function::new(
+            cx.clone(),
+            move |cx: Ctx<'js>,
+                  policy: Opt<Value<'js>>,
+                  opts: Opt<Value<'js>>|
+                -> rquickjs::Result<Value<'js>> {
+                // Parse the partial policy: only `canSpawnAndKill` for now.
+                let req_csk: Option<bool> = match &policy.0 {
+                    Some(v) if v.is_object() => {
+                        v.as_object().unwrap().get::<_, Option<bool>>("canSpawnAndKill")?
+                    }
+                    _ => None,
+                };
+                // Target pid: defaults to self.
+                let target: Pid = match &opts.0 {
+                    Some(v) if v.is_object() => {
+                        let pid: Option<u64> = v.as_object().unwrap().get("pid")?;
+                        pid.unwrap_or(s.pid)
+                    }
+                    _ => s.pid,
+                };
+
+                if target == s.pid {
+                    // Narrow under the lock, then snapshot the value and
+                    // release before building the JS object (no Rust mutex
+                    // held across JS allocation).
+                    let post: Sandbox = {
+                        let mut sb = s.sandbox.lock().unwrap();
+                        if let Some(false) = req_csk {
+                            sb.can_spawn_and_kill = false;
+                        }
+                        // `Some(true)` and `None` are no-ops: never widen.
+                        *sb
+                    };
+                    return sandbox_snapshot(&cx, &post);
+                }
+
+                // Cross-target: only actual narrowing is permitted (no pure
+                // reads of another's sandbox, no widen attempts).
+                if req_csk != Some(false) {
+                    return Err(js_type_error(
+                        &cx,
+                        "restrictSandbox on another process must set canSpawnAndKill to false",
+                    ));
+                }
+                // The caller must currently hold the toggle it is dropping.
+                if !s.sandbox.lock().unwrap().can_spawn_and_kill {
+                    return Err(permission_error(
+                        &cx,
+                        "not permitted to restrict other processes",
+                    ));
+                }
+                let Some(target_shared) = w.processes.lock().unwrap().get(&target).cloned() else {
+                    return Err(js_type_error(&cx, "unknown pid"));
+                };
+                let post: Sandbox = {
+                    let mut sb = target_shared.sandbox.lock().unwrap();
+                    sb.can_spawn_and_kill = false;
+                    *sb
+                };
+                sandbox_snapshot(&cx, &post)
+            },
+        )?,
     )?;
 
     let w = world.clone();
@@ -379,18 +561,38 @@ fn fmt_value<'js>(cx: &Ctx<'js>, v: &Value<'js>) -> rquickjs::Result<String> {
     }
 }
 
-/// Build a `TypeError` and return it as an `Error::Exception`.
-pub fn js_type_error(cx: &Ctx<'_>, msg: &str) -> rquickjs::Error {
+/// Build a `{canSpawnAndKill: bool}` snapshot of a sandbox for the JS API.
+fn sandbox_snapshot<'js>(cx: &Ctx<'js>, sb: &Sandbox) -> rquickjs::Result<Value<'js>> {
+    let obj = Object::new(cx.clone())?;
+    obj.set("canSpawnAndKill", sb.can_spawn_and_kill)?;
+    Ok(obj.into_value())
+}
+
+/// Build a JS `Error` of the named class (e.g. `"TypeError"`,
+/// `"PermissionError"`) carrying `msg` and return it as an `Error::Exception`.
+/// The class must already be defined in the context's global scope.
+pub fn js_named_error(cx: &Ctx<'_>, class: &str, msg: &str) -> rquickjs::Error {
     let literal = cx
         .json_stringify(msg.to_string())
         .ok()
         .flatten()
         .and_then(|s| s.to_string().ok())
         .unwrap_or_else(|| "\"error\"".to_string());
-    match cx.eval::<Value, _>(format!("new TypeError({literal})")) {
+    match cx.eval::<Value, _>(format!("new {class}({literal})")) {
         Ok(e) => cx.throw(e),
         Err(_) => rquickjs::Error::new_from_js_message("value", "message", msg),
     }
+}
+
+/// Build a `TypeError` and return it as an `Error::Exception`.
+pub fn js_type_error(cx: &Ctx<'_>, msg: &str) -> rquickjs::Error {
+    js_named_error(cx, "TypeError", msg)
+}
+
+/// Build a `PermissionError` (a global class defined in every process) and
+/// return it as an `Error::Exception`. Used by the sandbox gates.
+pub fn permission_error(cx: &Ctx<'_>, msg: &str) -> rquickjs::Error {
+    js_named_error(cx, "PermissionError", msg)
 }
 
 /// Render the pending exception of a context as a readable string.

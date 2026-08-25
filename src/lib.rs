@@ -6,4 +6,5 @@
 //! when its mailbox is empty.
 
 pub mod process;
+pub mod rpc;
 pub mod scheduler;

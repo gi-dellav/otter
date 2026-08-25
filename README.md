@@ -32,7 +32,7 @@ runtime exits when all processes (including spawned ones) have finished.
 
 | API | Description |
 | --- | --- |
-| `spawn(code)` | Start a new process from a source string, returns its pid. |
+| `spawn(code, opts?)` | Start a new process from a source string, returns its pid. Optional `{ sandbox: { canSpawnAndKill: false } }` narrows the child's sandbox at birth. |
 | `send(pid, value)` | Serialize `value` to JSON and deliver it to `pid`'s mailbox. Messages to dead pids are dropped silently. |
 | `await recv(timeoutMs?)` | Suspend until a message arrives; resolves with the parsed value. With a `timeoutMs` it rejects with a `TimeoutError` if no message arrives in time (a message that races the deadline stays in the mailbox). |
 | `await sleep(ms)` | Suspend the process for at least `ms` milliseconds; does not touch the mailbox. |
@@ -44,6 +44,8 @@ runtime exits when all processes (including spawned ones) have finished.
 | `processInfo(pid)` | `{pid, name, status}` for a live pid, or `null`. |
 | `processCount()` | Number of live processes. |
 | `setName(name)` | Rename the current process; visible in `listProcesses()`/`processInfo()`. |
+| `selfSandbox()` | Snapshot `{canSpawnAndKill}` of the current process's sandbox policy. |
+| `restrictSandbox(policy?, opts?)` | Narrow a sandbox at runtime (self by default, or `{pid}`). Monotonic/irrevocable; returns the post-state. |
 | `console.log/error` | Line-oriented output prefixed with the pid. |
 
 Scripts support top-level `await`. Full API docs live in [`docs/`](docs/README.md).
@@ -56,6 +58,7 @@ cargo run --release -- --workers 1 examples/ring.js   # 1000 processes on ONE th
 cargo run --release -- examples/coop.js               # yieldNow()-driven interleaving
 cargo run --release -- examples/timer.js              # sleep() and recv(timeoutMs) watchdog
 cargo run --release -- examples/process_mgmt.js       # list, inspect, rename, and kill processes
+cargo run --release -- examples/sandbox.js           # spawn confined children, self-restrict, no-escalation
 ```
 
 ## Limitations (v1)
@@ -72,6 +75,9 @@ cargo run --release -- examples/process_mgmt.js       # list, inspect, rename, a
   after a `sleep()` is fine once the sleep has completed.
 - Messages must be JSON-serializable; functions, symbols and `undefined` are
   rejected.
+- Sandboxing is a single toggle today (`canSpawnAndKill`); it gates only `spawn`
+  and `killProcess(other)`. `send`/`recv`/`sleep`/`yieldNow` are unrestricted,
+  and there is no CPU/memory isolation. See [`docs/api.md`](docs/api.md#sandboxing).
 
 ## Tests
 

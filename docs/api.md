@@ -6,7 +6,7 @@ of a file as well as inside async functions.
 
 ---
 
-## `spawn(code) → pid`
+## `spawn(code, opts?) → pid`
 
 Starts a new process from a JavaScript source string and returns its pid
 (`u64`). The child gets a fresh, fully isolated runtime and mailbox; it can
@@ -20,6 +20,16 @@ const pid = spawn(`send(0, "hello from a child");`);
   returns).
 - A syntax error in `code` raises a `TypeError` in the caller.
 - The child's pid is unique across the whole runtime.
+- **Sandboxing:** the child inherits the parent's sandbox by default. Pass
+  an options object to narrow it at birth — see [Sandboxing](#sandboxing):
+
+  ```js
+  spawn(code, { sandbox: { canSpawnAndKill: false } }); // confined child
+  ```
+
+  A process whose own sandbox denies `canSpawnAndKill` cannot `spawn` at all
+  (it throws `PermissionError`); the child's sandbox can only ever be
+  *narrower* than the parent's, never wider.
 
 ## `send(pid, value)`
 
@@ -136,6 +146,11 @@ if (killProcess(other)) {
   `isProcessAlive`/`listProcesses` no longer see it. Pids are never reused.
 - A process stuck in a long synchronous loop (no `await`/`yieldNow()`) will
   not die until it yields — same cooperative limit as scheduling.
+- **Sandboxing:** killing *another* process requires the caller's sandbox to
+  hold `canSpawnAndKill` (see [Sandboxing](#sandboxing)). Killing *self* is
+  always allowed, even when confined. The permission check runs *before* the
+  liveness check, so a confined process that calls `killProcess(unknownPid)`
+  gets a `PermissionError` rather than learning the pid is unknown.
 
 ## `listProcesses() → array`
 
@@ -206,11 +221,85 @@ public API and may change at any time.
 ## Error types
 
 - **`TypeError`** — bad argument to a builtin (non-serializable message,
-  overlapping suspensions, `spawn` of invalid source).
+  overlapping suspensions, `spawn` of invalid source, a malformed
+  `restrictSandbox` request).
 - **`TimeoutError`** — rejection value of `recv(timeoutMs)` when it times
   out. Defined in every process's global scope.
+- **`PermissionError`** — a privileged operation was attempted by a
+  process whose sandbox denies it (`spawn` or `killProcess(other)` while
+  `canSpawnAndKill` is off, or `restrictSandbox` on another process while
+  the caller lacks the toggle being dropped). Defined in every process's
+  global scope.
 - Any other uncaught exception kills only the process that raised it; the
   runtime exits non-zero if at least one process failed.
+
+## Sandboxing
+
+Each process carries a **sandbox policy**: a set of on/off toggles that gate
+privileged operations. Toggles only ever **narrow** — a process can drop a
+permission it holds, but can never gain one it lacks. Every change is an
+intersection, so confinement is irrevocable in effect: once a toggle is off,
+no later call can turn it back on.
+
+Today there is one toggle:
+
+- **`canSpawnAndKill`** — if `false`, the process may not `spawn` and may not
+  `killProcess` *other* processes. Killing *self* is always allowed.
+
+### Defaults and inheritance
+
+- Root processes (the scripts on the `otter` command line) start
+  **privileged** (`canSpawnAndKill: true`).
+- A spawned child **inherits** the parent's sandbox by default.
+- A child can only ever be *narrower* than the parent: passing
+  `{ sandbox: { canSpawnAndKill: false } }` to `spawn` confines the child,
+  but a confined process cannot spawn at all, and could not grant privileges
+  it lacks even if it could (no escalation).
+
+### `selfSandbox() → { canSpawnAndKill: boolean }`
+
+Returns a snapshot of the calling process's own sandbox. The only way to read
+a sandbox across the JS API; capability info is deliberately **not** exposed
+via `processInfo`/`listProcesses`.
+
+```js
+if (!selfSandbox().canSpawnAndKill) throw new Error("i am confined");
+```
+
+### `restrictSandbox(policy?, opts?) → { canSpawnAndKill: boolean }`
+
+Narrows a sandbox at runtime. `policy` is a *partial* sandbox object
+`{ canSpawnAndKill?: boolean }`; absent keys are left untouched (per-toggle
+granularity, forward-compatible with more toggles). Returns the affected
+sandbox's **post-state**.
+
+```js
+restrictSandbox({ canSpawnAndKill: false });          // self: drop, irrevocable
+restrictSandbox({ canSpawnAndKill: false }, { pid: child }); // narrow a child
+restrictSandbox();                                      // self: pure read
+```
+
+Semantics, per present key: `new = current & requested`. So `false` narrows
+and `true` is a no-op (it never widens). The result is therefore monotonic:
+asking to re-grant a dropped toggle is silently intersected away, and the
+returned snapshot tells you so.
+
+- **Self-target** (the default, or `opts.pid === self()`): always allowed —
+  narrowing yourself is a pure loss of privilege, needing none to begin with.
+  An empty/omitted policy is a pure read.
+- **Other-target** (`opts.pid` set to another pid): only an actual narrowing
+  is permitted — the policy must set `canSpawnAndKill` to `false`. A pure
+  read or a widen attempt (`{}` or `{canSpawnAndKill: true}`) raises a
+  `TypeError`, since cross-target reads of another sandbox are not allowed.
+  The caller must currently hold the toggle it is dropping, else
+  `PermissionError`. An unknown target raises `TypeError` *after* the
+  privilege check, so a confined caller targeting a dead pid still gets
+  `PermissionError` first (no liveness leak).
+
+The standard secure pattern is setup-then-drop, like `pledge`/seccomp: a
+privileged process sets up its resources, then calls
+`restrictSandbox({ canSpawnAndKill: false })` on itself and can no longer
+spawn or kill others for the rest of its life.
 
 ## Suspension rules
 

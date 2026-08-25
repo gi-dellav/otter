@@ -28,3 +28,4 @@ processes.
 | Sleeping | A process that called `sleep(ms)` is parked in a separate `sleeping` map, unreachable by `send`. A timer entry re-queues it when the deadline passes. |
 | Timers | Serviced by idle workers every ~5 ms (best-effort, not real-time). |
 | Management | `listProcesses()`, `killProcess(pid)`, `isProcessAlive(pid)`, `processInfo(pid)`, `processCount()`, `setName(name)`. Kills are cooperative: the target is reaped at its next scheduling boundary. |
+| Sandboxing | Per-process on/off toggles that gate privileged ops. One toggle today: `canSpawnAndKill` gates `spawn` and `killProcess(other)` (self-kill always allowed). Set at birth via `spawn(code, {sandbox:{...}})` (inherited, narrowed — no escalation) or narrowed at runtime via `restrictSandbox()` (monotonic/irrevocable). Read with `selfSandbox()`. Violations throw `PermissionError`. |

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rquickjs::{Context, Ctx, Function, Value};
 
-use crate::process::{self, ProcShared, Process, Status};
+use crate::process::{self, ProcShared, Process, Sandbox, Status};
 
 pub type Pid = u64;
 
@@ -105,15 +105,24 @@ impl World {
     }
 }
 
-/// Create a process from JS source, register it, and schedule it.
-pub fn spawn_process(world: &Arc<World>, name: &str, source: &str) -> Result<Pid, String> {
+/// Create a process from JS source, register it, and schedule it. The
+/// `sandbox` argument fixes the new process's initial sandbox; callers are
+/// responsible for narrowing it relative to the parent. The `spawn` JS
+/// callback does this by starting from the parent's sandbox and turning off
+/// the toggles the caller explicitly requested (a monotonic narrowing —/// see `Sandbox::intersect` for the conceptual model).
+pub fn spawn_process(
+    world: &Arc<World>,
+    name: &str,
+    source: &str,
+    sandbox: Sandbox,
+) -> Result<Pid, String> {
     let pid = world.next_pid.fetch_add(1, Ordering::Relaxed);
     let (inbox_tx, inbox_rx) = mpsc::channel();
     // Register the inbox BEFORE the entry script is evaluated: code that
     // runs during the eval (e.g. a child spawned synchronously) must be
     // able to deliver messages to this process already.
     world.inboxes.lock().unwrap().insert(pid, inbox_tx);
-    let proc = match process::create_process(world, pid, name, source, inbox_rx) {
+    let proc = match process::create_process(world, pid, name, source, inbox_rx, sandbox) {
         Ok(proc) => proc,
         Err(e) => {
             world.inboxes.lock().unwrap().remove(&pid);
@@ -161,6 +170,16 @@ pub fn send_message<'js>(
         }
     };
 
+    deliver_json_string(world, pid, json);
+    Ok(())
+}
+
+/// Push a pre-serialized JSON string into a process's mailbox. Buffers the
+/// message *before* re-queuing the process (push-then-unpark), so a woken
+/// process is guaranteed to see it. Shared with the RPC control layer, which
+/// supplies already-JSON text (serialized outside a QuickJS context) instead
+/// of a JS lvalue.
+pub fn deliver_json_string(world: &Arc<World>, pid: Pid, json: String) {
     let tx = world.inboxes.lock().unwrap().get(&pid).cloned();
     if let Some(tx) = tx
         && tx.send(json).is_ok()
@@ -172,7 +191,6 @@ pub fn send_message<'js>(
             let _ = world.queue_tx.send(RunItem::Process(p));
         }
     }
-    Ok(())
 }
 
 /// Request termination of a live process. Best-effort and cooperative: the
