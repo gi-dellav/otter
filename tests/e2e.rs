@@ -4,8 +4,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use otter::process::Sandbox;
-use otter::scheduler::{RunItem, World, spawn_process, worker_loop};
+use otter_rt::process::Sandbox;
+use otter_rt::scheduler::{RunItem, World, spawn_process, worker_loop};
 
 fn wait_for_completion(world: &Arc<World>, timeout: Duration) {
     let active = world.active.lock().unwrap();

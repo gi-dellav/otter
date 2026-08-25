@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use otter::scheduler::{RunItem, World, worker_loop};
+use otter_rt::scheduler::{RunItem, World, worker_loop};
 use serde_json::{json, Value};
 
 /// Live server + worker under test.
@@ -30,13 +30,13 @@ fn start_harness() -> Harness {
     let w = world.clone();
     let worker = std::thread::spawn(move || worker_loop(w));
 
-    let listener = otter::rpc::bind("127.0.0.1", 0).expect("bind rpc ephemeral");
+    let listener = otter_rt::rpc::bind("127.0.0.1", 0).expect("bind rpc ephemeral");
     let port = ephemeral_port(&listener);
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let w2 = world.clone();
     let s2 = shutdown.clone();
-    let server = std::thread::spawn(move || otter::rpc::serve_loop(listener, w2, s2));
+    let server = std::thread::spawn(move || otter_rt::rpc::serve_loop(listener, w2, s2));
 
     Harness { world, worker, port, shutdown, server }
 }

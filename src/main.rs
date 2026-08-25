@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use otter::process::Sandbox;
-use otter::scheduler::{RunItem, World, worker_loop};
+use otter_rt::process::Sandbox;
+use otter_rt::scheduler::{RunItem, World, worker_loop};
 
 fn default_workers() -> usize {
     std::thread::available_parallelism()
@@ -67,7 +67,7 @@ fn main() {
             .unwrap_or_else(|| path.display().to_string());
         match std::fs::read_to_string(path) {
             Ok(source) => {
-                if let Err(msg) = otter::scheduler::spawn_process(&world, &name, &source, Sandbox::PRIVILEGED) {
+                if let Err(msg) = otter_rt::scheduler::spawn_process(&world, &name, &source, Sandbox::PRIVILEGED) {
                     eprintln!("otter: failed to start {}: {msg}", path.display());
                 }
             }
@@ -81,13 +81,13 @@ fn main() {
     let rpc_shutdown = Arc::new(AtomicBool::new(false));
     let rpc_handle = match args.rpc_port {
         Some(port) => {
-            match otter::rpc::bind(&args.rpc_host, port) {
+            match otter_rt::rpc::bind(&args.rpc_host, port) {
                 Ok(listener) => {
                     let w = world.clone();
                     let shutdown = rpc_shutdown.clone();
                     let handle = std::thread::Builder::new()
                         .name("otter-rpc".to_string())
-                        .spawn(move || otter::rpc::serve_loop(listener, w, shutdown))
+                        .spawn(move || otter_rt::rpc::serve_loop(listener, w, shutdown))
                         .expect("failed to spawn rpc thread");
                     eprintln!(
                         "otter: JSON-RPC control server on {}:{port} (call `shutdown` to stop, `list`/`spawn`/`kill`/`send`/`rename` to drive)",
