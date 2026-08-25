@@ -1,5 +1,5 @@
 [package]
-name = "otter"
+name = "otter-rt"
 version = "0.1.0"
 edition = "2024"
 authors = ["Giuseppe Della Vedova"]
