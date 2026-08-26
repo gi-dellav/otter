@@ -28,6 +28,28 @@ otter [--workers N] script.js [more_scripts.js ...]
 Every file on the command line starts as its own process (pids `0..n`); the
 runtime exits when all processes (including spawned ones) have finished.
 
+## JSON-RPC control (RPC)
+
+otter can expose a JSON-RPC 2.0 control socket over TCP, letting an external
+tool drive the scheduler exactly like the in-JS API: `spawn`, `list`, `info`,
+`kill`, `send`, `rename`, `count`, and `shutdown`. Enable it with
+`--rpc-port` (the runtime then stays alive until you call `shutdown`); frames
+are line-delimited, one request per line, so any CLI that speaks TCP works:
+
+```sh
+# start a runtime with a control socket on port 9000
+otter --rpc-port 9000 script.js &
+
+# drive it with netcat (or any line-based TCP client)
+echo '{"jsonrpc":"2.0","id":1,"method":"list"}' | nc 127.0.0.1 9000
+echo '{"jsonrpc":"2.0","id":2,"method":"spawn","params":{"code":"await recv();"}}' | nc 127.0.0.1 9000
+echo '{"jsonrpc":"2.0","id":3,"method":"send","params":{"pid":1,"value":"hi"}}' | nc 127.0.0.1 9000
+echo '{"jsonrpc":"2.0","id":4,"method":"shutdown"}' | nc 127.0.0.1 9000
+```
+
+Each request carries a numeric/string `id` and receives a matching response;
+notifications (no `id`) get none, per the JSON-RPC 2.0 spec.
+
 ## JS API
 
 | API | Description |
