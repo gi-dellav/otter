@@ -1,5 +1,7 @@
 # otter
 
+![Sea Otter](https://upload.wikimedia.org/wikipedia/commons/0/02/Sea_Otter_%28Enhydra_lutris%29_%2825169790524%29_crop.jpg)
+
 Experimental BEAM-like JavaScript runtime on QuickJS (via [rquickjs](https://crates.io/crates/rquickjs)).
 
 Many isolated JS **processes** are multiplexed onto a small, fixed pool of OS
@@ -17,6 +19,12 @@ a mailbox; processes communicate only by message passing.
   a message arrives. Nothing blocks an OS thread.
 - **Isolation** = an uncaught error kills only its process; the exit code is
   non-zero if any process failed.
+
+## Install
+
+```sh
+cargo install otter-rt
+```
 
 ## Build & run
 
